@@ -1,0 +1,20 @@
+version: "3.1"
+services:
+  redisinsight:
+    image: redislabs/redisinsight:latest
+    ports:
+      - "8001:8001"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis
+    restart: always
+    command: redis-server --requirepass Sej@feliz8
+    ports:
+      - 6379:6379
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

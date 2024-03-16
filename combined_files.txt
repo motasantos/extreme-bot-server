@@ -1,0 +1,406 @@
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/chat/AssistantCollection.ts
+----------------
+import OpenAIChatManager from "../openai/OpenAIChatManager";
+import RedisManager from "../redis/RedisManager";
+import {AssistantParams} from '../interfaces/AssistantParams';
+
+class AssistantCollection {
+    // Mapa aninhado: Cliente ID -> (Tipo de Assistente -> OpenAIChatManager)
+    private assistantManagers: Map<string, Map<string, OpenAIChatManager>>;
+    private redisManager: RedisManager;
+
+    constructor(redisManager: RedisManager) {
+        this.redisManager = redisManager; 
+        this.assistantManagers = new Map();
+    }
+
+    async createOrUpdateAssistant(clientId: string, assistantType: string, assistantParams: AssistantParams): Promise<string> {
+        // Verificar se o assistente já existe para este cliente
+        const assistantId = await this.redisManager.hget(`cliente:${clientId}:assistants`, assistantType);
+
+        if (assistantId) {
+            // Assistente já existe, então atualizar os parâmetros
+            await this.updateAssistant(clientId, assistantType, assistantParams);
+            return assistantId;
+        } else {
+            // Criar um novo assistente
+            return this.createAssistant(clientId, assistantType, assistantParams);
+        }
+    }
+
+    private async createAssistant(clientId: string, assistantType: string, assistantParams: AssistantParams): Promise<string> {
+        const chatManager = new OpenAIChatManager(this.redisManager, assistantParams);
+        const threadId = await chatManager.getOrCreateThread(null);
+
+        await this.redisManager.hset(`cliente:${clientId}:assistants`, assistantType, threadId);
+
+        return threadId;
+    }
+
+    private async updateAssistant(clientId: string, assistantType: string, assistantParams: AssistantParams): Promise<void> {
+        const assistantId = await this.redisManager.hget(`cliente:${clientId}:assistants`, assistantType);
+
+        if (!assistantId) {
+            throw new Error('Assistente não encontrado');
+        }
+
+        // Atualizar os parâmetros do assistente no Redis
+        await this.redisManager.hset(`cliente:${clientId}:assistants`, assistantType, JSON.stringify(assistantParams));
+
+
+        // Se necessário, também atualizar os parâmetros do assistente na OpenAI
+        // Isso pode envolver chamar um método na classe OpenAIChatManager para atualizar os parâmetros
+    }
+
+    async getAssistantManager(clientId: string, assistantType: string, assistantParams: AssistantParams): Promise<OpenAIChatManager> {
+        // Verificar se existe um mapa para este clientId
+        if (!this.assistantManagers.has(clientId)) {
+            this.assistantManagers.set(clientId, new Map<string, OpenAIChatManager>());
+        }
+
+        const typeManagers = this.assistantManagers.get(clientId)!;
+
+        // Se o tipo específico de assistente não estiver presente, criá-lo e adicioná-lo ao mapa
+        if (!typeManagers.has(assistantType)) {
+            const chatManager = new OpenAIChatManager(this.redisManager, assistantParams);
+            typeManagers.set(assistantType, chatManager);
+        }
+
+        return typeManagers.get(assistantType)!;
+    }
+
+    // Adicione métodos adicionais conforme necessário, por exemplo, para remover assistentes ou listar todos os tipos de assistentes para um cliente
+}
+
+export default AssistantCollection;
+
+
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/config/config.ts
+----------------
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+interface Config {
+    openaiApiKey: string;
+    openAiAssistantKey: string;
+    redisHost: string;
+    redisPort: number;
+    redisPassword: string;
+}
+
+const config: Config = {
+    openaiApiKey: process.env.OPENAI_API_KEY || '', // Corrigido para OPENAI_API_KEY
+    openAiAssistantKey: process.env.OPENAI_ASSISTANT_KEY || '', // Corrigido para OPENAI_ASSISTANT_KEY
+    redisHost: process.env.REDIS_HOST || 'localhost',
+    redisPort: parseInt(process.env.REDIS_PORT || '6379'),
+    redisPassword: process.env.REDIS_PASSWORD || '',
+};
+
+export default config;
+
+
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/interfaces/AssistantParams.ts
+----------------
+export interface AssistantParams {
+    id?: string;
+    name: string;
+    model: string;
+    instructions: string;
+}
+
+
+
+
+
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/openai/OpenAIChatManager.ts
+----------------
+import config from '../config/config';
+import RedisManager from '../redis/RedisManager';
+import { openaiClient } from './openaiClient';
+import {AssistantParams} from '../interfaces/AssistantParams';
+
+class OpenAIChatManager {
+    private redisManager: RedisManager;
+    private assistantKey = config.openAiAssistantKey;
+    private assistantId?: string;
+    private maxRunAttempts = 5; // Máximo de tentativas para o run
+
+
+    constructor(redisManager: RedisManager, assistantParams: AssistantParams) {
+        this.redisManager = redisManager;
+        this.initializeAssistant(assistantParams).catch(error => console.error('Error initializing assistant:', error));
+    }
+
+    private async initializeAssistant(params: AssistantParams): Promise<void> {
+        const assistantExists = await this.checkAssistantExists(params.name);
+        if (!assistantExists) {
+            await this.createAssistantInOpenAI(params);
+        }
+    }
+    
+    private async checkAssistantExists(assistantName: string): Promise<boolean> {
+        const assistantData = await this.redisManager.get(assistantName);
+        if (assistantData) {
+            this.assistantId = JSON.parse(assistantData).id;
+            return true;
+        }
+        return false;
+    }
+    
+    private async createAssistantInOpenAI(params: AssistantParams): Promise<void> {
+        try {
+            const newAssistant = await openaiClient.beta.assistants.create(params);
+            this.assistantId = newAssistant.id;
+            await this.redisManager.set(params.name, JSON.stringify({ ...params, id: newAssistant.id }));
+        } catch (error) {
+            console.error("Erro ao criar assistente na OpenAI:", error);
+            throw error;
+        }
+    }
+    
+
+    async getOrCreateThread(threadId: string | null): Promise<string> {
+        if (!threadId) {
+            const thread = await openaiClient.beta.threads.create();
+            return thread.id;
+        } else {
+            // Verificar se o threadId fornecido é válido
+            try {
+                const existingThread = await openaiClient.beta.threads.retrieve(threadId);
+                return existingThread.id;
+            } catch {
+                // Se não for válido, criar uma nova thread
+                const thread = await openaiClient.beta.threads.create();
+                return thread.id;
+            }
+        }
+    }
+
+    async sendMessageAndGetResponse(threadId: string | null, message: string): Promise<{ response: string, threadId: string }> {
+        const validThreadId = await this.getOrCreateThread(threadId);
+    
+        await openaiClient.beta.threads.messages.create(validThreadId, {
+            role: 'user',
+            content: message
+        });
+    
+        const run = await openaiClient.beta.threads.runs.create(validThreadId, {
+            assistant_id: this.assistantId || '' // Certifique-se de que this.assistantId seja uma string válida ou defina um valor padrão
+        });
+    
+        let runStatus;
+        let attempts = 0;
+        do {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const runDetails = await openaiClient.beta.threads.runs.retrieve(validThreadId, run.id);
+            runStatus = runDetails.status;
+            if (runStatus === 'failed') {
+                throw new Error("Falha na execução do assistente: " + JSON.stringify(run));
+            }
+            attempts++;
+        } while (runStatus !== 'completed' && attempts < this.maxRunAttempts);
+    
+        if (runStatus !== 'completed') {
+            throw new Error("Falha ao obter resposta do assistente.");
+        }
+    
+        // Recuperar a lista de mensagens e encontrar a última mensagem do assistente
+        const messages = await openaiClient.beta.threads.messages.list(validThreadId);
+        const lastAssistantMessage = messages.data.reverse().find((m: any) => m.role === 'assistant')?.content;
+    
+        const lastMessageContent = lastAssistantMessage && typeof lastAssistantMessage === 'string' ? lastAssistantMessage : '';
+        return { response: lastMessageContent, threadId: validThreadId };
+    }
+    }
+
+export default OpenAIChatManager;
+
+
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/openai/openaiClient.ts
+----------------
+import config from '../config/config';
+import { OpenAI, ClientOptions } from 'openai'; // Certifique-se de importar também ClientOptions
+
+let openaiClient: OpenAI;
+
+async function loadOpenAI() {
+    const { OpenAI } = await import('openai');
+    
+    // Crie um objeto de opções do cliente
+    const options: ClientOptions = {
+        apiKey: config.openaiApiKey
+        // Outras opções, se necessário
+    };
+
+    // Passe as opções para inicializar o cliente
+    openaiClient = new OpenAI(options);
+}
+
+loadOpenAI().catch(console.error);
+
+export { openaiClient };
+
+
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/redis/RedisManager.ts
+----------------
+import Redis from 'ioredis';
+import config from '../config/config';
+
+class RedisManager {
+    private redisClient: Redis;
+
+    constructor() {
+        this.redisClient = new Redis({
+            host: config.redisHost,
+            port: config.redisPort,
+            password: config.redisPassword,
+            retryStrategy: times => Math.min(times * 50, 2000)
+        });
+
+    }
+
+    async hset(key: string, field: string, value: string): Promise<number | null> {
+        try {
+            return await this.redisClient.hset(key, field, value);
+        } catch (error) {
+            console.error('Error setting value in Redis hash:', error);
+            return null;
+        }
+    }
+
+    async get(key: string): Promise<string | null> {
+        try {
+            return await this.redisClient.get(key);
+        } catch (error) {
+            console.error('Error getting value from Redis:', error);
+            return null;
+        }
+    }
+
+    async set(key: string, value: string): Promise<'OK' | null> {
+        try {
+            return await this.redisClient.set(key, value);
+        } catch (error) {
+            console.error('Error setting value in Redis:', error);
+            return null;
+        }
+    }
+
+    async hget(key: string, field: string): Promise<string | null> {
+        try {
+            return await this.redisClient.hget(key, field);
+        } catch (error) {
+            console.error('Error getting value from Redis hash:', error);
+            return null;
+        }
+    }
+    
+
+    async updateInteraction(userId: string, assistantName: string, threadId: string) {
+        const key = `users-interaction:${userId}`;
+        const currentTime = Date.now();
+        const interactionData = { threadId, lastInteraction: currentTime };
+    
+        // Verificar se é para usar Hash ou String
+        await this.redisClient.hset(key, assistantName, JSON.stringify(interactionData)); // Para Hash
+        // Ou para String, obter o objeto atual, atualizá-lo e regravá-lo
+    }
+    
+
+    // Este método permanece útil para obter o threadId pelo phoneNumber
+    // Mas agora, ele não tenta mais criar um novo thread diretamente, essa responsabilidade é do OpenAIChatManager
+    async getThreadIdByPhoneNumber(phoneNumber: string): Promise<string | null> {
+        return await this.redisClient.get(phoneNumber);
+    }
+}
+
+export default RedisManager;
+
+
+----------------
+File: /home/jailson/Projetos/chatbots/extreme-bot/extreme-bot-server/src/server.ts
+----------------
+import express, { Request, Response, NextFunction } from 'express';
+import Joi from 'joi';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import RedisManager from './redis/RedisManager';
+import AssistantCollection from './chat/AssistantCollection';
+
+const app = express();
+const port = 3000;
+
+// Segurança básica com Helmet
+app.use(helmet());
+
+// Limitador de taxa de requisição
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100, // Limita cada IP a 100 requisições por janela de tempo
+});
+app.use(limiter);
+
+app.use(express.json());
+
+const redisManager = new RedisManager();
+const assistantCollection = new AssistantCollection(redisManager);
+
+// Esquema de validação com Joi
+const assistantSchema = Joi.object({
+  name: Joi.string().required(),
+  model: Joi.string().required(),
+  instructions: Joi.string().required(),
+  userInput: Joi.string().required(),
+});
+
+// Middleware de captura de erros assíncronos
+const asyncHandler = (fn: (req: Request, res: Response, next: NextFunction) => any) => 
+    (req: Request, res: Response, next: NextFunction) => Promise.resolve(fn(req, res, next)).catch(next);
+
+
+  app.post('/conversations/:phoneNumber', async (req, res) => {
+    try {
+        const phoneNumber = req.params.phoneNumber;
+        const { userInput } = req.body; // Assumindo que você esteja enviando isso na requisição
+        
+        // Tenta recuperar um threadId existente para o número de telefone
+        let threadId = await redisManager.getThreadIdByPhoneNumber(phoneNumber);
+
+        if (!threadId) {
+            // Supõe-se que você tenha um método para obter uma instância de OpenAIChatManager
+            // Isso pode envolver buscar as configurações específicas do assistente baseadas no contexto, por exemplo
+            const chatManager = await assistantCollection.getAssistantManager({ name: "NomeDoAssistente", model: "ModeloDoAssistente", instructions: "Instruções" });
+            threadId = await chatManager.getOrCreateThread(null);
+            await redisManager.set(phoneNumber, threadId);
+        }
+
+        // Agora, envie a mensagem para a thread específica e obtenha a resposta
+        const chatManager = await assistantCollection.getAssistantManager({ name: "NomeDoAssistente", model: "ModeloDoAssistente", instructions: "Instruções" });
+        const { response } = await chatManager.sendMessageAndGetResponse(threadId, userInput);
+
+        res.json({ threadId, response });
+    } catch (error) {
+        console.error("Erro ao processar a mensagem:", error);
+        res.status(500).send("Erro ao processar a mensagem");
+    }
+});
+
+
+// Middleware global de tratamento de erros
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error(err.stack);
+  res.status(500).send('Algo deu errado!');
+});
+
+app.listen(port, () => {
+  console.log(`Servidor está ouvindo na porta ${port}`);
+});
+
+
